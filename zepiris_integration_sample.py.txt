@@ -1,0 +1,98 @@
+// hooks/useFaceAttendance.js
+import { useState } from 'react';
+import * as ImagePicker from 'expo-image-picker';
+import { supabase } from '../lib/supabase'; // your existing client
+
+const ZEPIRIS_URL = 'http://YOUR_VPS_IP:8000'; // or https://face.yourapp.com
+const TENANT = 'my_attendance_app';
+const MATCH_THRESHOLD = 0.5;
+
+export function useFaceAttendance() {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+
+  async function checkIn() {
+    setLoading(true);
+    setResult(null);
+
+    try {
+      // 1. Take selfie
+      const photo = await ImagePicker.launchCameraAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.8,
+        allowsEditing: false,
+      });
+
+      if (photo.canceled) { setLoading(false); return; }
+
+      // 2. Build multipart form
+      const uri = photo.assets[0].uri;
+      const form = new FormData();
+      form.append('id', `checkin_${Date.now()}`);
+      form.append('tenant', TENANT);
+      form.append('file', {
+        uri,
+        name: 'selfie.jpg',
+        type: 'image/jpeg',
+      });
+
+      // 3. Call ZepIris search
+      const res = await fetch(`${ZEPIRIS_URL}/v1/faces/search?top_k=1`, {
+        method: 'POST',
+        body: form,
+      });
+      const data = await res.json();
+
+      const iqa = data.imageQualityAssessment || {};
+      const matches = data.searchResult?.matches || [];
+
+      // 4. Decide
+      if (!iqa.passed) {
+        setResult({ status: 'rejected', reason: getRejectionReason(iqa) });
+        return;
+      }
+
+      if (!matches.length || matches[0].score < MATCH_THRESHOLD) {
+        setResult({ status: 'not_found', score: matches[0]?.score });
+        return;
+      }
+
+      const topMatch = matches[0];
+
+      // 5. Write attendance to Supabase
+      const { data: emp } = await supabase
+        .from('employees')
+        .select('id, name, employee_code')
+        .eq('zepiris_face_id', topMatch.id)
+        .single();
+
+      if (!emp) {
+        setResult({ status: 'not_found' });
+        return;
+      }
+
+      await supabase.from('attendance_logs').insert({
+        employee_id: emp.id,
+        employee_code: emp.employee_code,
+        match_score: topMatch.score,
+        status: 'present',
+      });
+
+      setResult({ status: 'success', employee: emp, score: topMatch.score });
+
+    } catch (err) {
+      setResult({ status: 'error', message: err.message });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return { checkIn, loading, result };
+}
+
+function getRejectionReason(iqa) {
+  if (!iqa.nudity?.is_safe)   return 'Image flagged as unsafe';
+  if (iqa.spoof?.is_spoof)    return 'Spoofing detected — use a real face';
+  if (!iqa.blur?.is_sharp)    return 'Image too blurry — better lighting needed';
+  return 'Image quality check failed';
+}
